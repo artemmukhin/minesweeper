@@ -1,0 +1,8 @@
+[package]
+name = "minesweeper"
+version = "0.1.0"
+authors = ["ortem <ortem00@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+datafrog = "2.0.1"
