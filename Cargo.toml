@@ -6,3 +6,4 @@ edition = "2018"
 
 [dependencies]
 datafrog = "2.0.1"
+varisat = "0.2.2"

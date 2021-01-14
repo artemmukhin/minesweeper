@@ -1,6 +1,9 @@
 use datafrog;
 use datafrog::Iteration;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::iter;
+use std::iter::FromIterator;
+use varisat::{CnfFormula, ExtendFormula, Lit, Solver};
 
 #[cfg(test)]
 mod test;
@@ -121,7 +124,7 @@ pub enum ProbeResult {
     Unknown,
 }
 
-pub fn check_configuration(conf: Configuration) -> ProbeResult {
+pub fn check_configuration(conf: &Configuration) -> ProbeResult {
     // `bool` means safety of the square
     let mut verified: HashMap<(Row, Col), bool> = HashMap::new();
 
@@ -134,7 +137,7 @@ pub fn check_configuration(conf: Configuration) -> ProbeResult {
         let row_squares = row.iter().enumerate().map(|(j, square)| (i, j, *square));
         enumerated_squares.extend(row_squares);
     }
-    
+
     // find a probe, i.e. a move to check
     let probe: (Row, Col) = enumerated_squares
         .iter()
@@ -142,7 +145,8 @@ pub fn check_configuration(conf: Configuration) -> ProbeResult {
             Square::Probe => true,
             _ => false,
         })
-        .map(|(i, j, _)| (*i, *j)).expect("No probe provided");
+        .map(|(i, j, _)| (*i, *j))
+        .expect("No probe provided");
 
     // add all board cells into `squares`
     squares.extend(enumerated_squares);
@@ -202,4 +206,173 @@ pub fn check_configuration(conf: Configuration) -> ProbeResult {
         Some(false) => ProbeResult::Unsafe,
         None => ProbeResult::Unknown,
     }
+}
+
+fn powerset<T: Ord + Clone>(mut set: BTreeSet<T>) -> BTreeSet<BTreeSet<T>> {
+    if set.is_empty() {
+        let mut powerset = BTreeSet::new();
+        powerset.insert(set);
+        return powerset;
+    }
+    let entry = set.iter().nth(0).unwrap().clone();
+    set.remove(&entry);
+    let mut powerset = powerset(set);
+    for mut set in powerset.clone().into_iter() {
+        set.insert(entry.clone());
+        powerset.insert(set);
+    }
+    powerset
+}
+
+fn format_with_radix(mut n: u32, radix: u32, len: u32) -> Vec<u32> {
+    assert!(2 <= radix && radix <= 36);
+
+    let mut result: Vec<u32> = vec![];
+
+    loop {
+        result.push(n % radix);
+        n /= radix;
+        if n == 0 {
+            break;
+        }
+    }
+
+    result.resize(len as usize, 0);
+    result
+}
+
+pub fn solve_sat_problem(conf: &Configuration) -> bool {
+    let board_size = conf.board.len();
+
+    // find a probe, i.e. a move to check
+    let mut probe: Option<(Row, Col)> = None;
+
+    for row in 0..board_size {
+        for col in 0..board_size {
+            let cell = conf.board[row][col];
+            match cell {
+                Square::Probe => probe = Some((row, col)),
+                _ => {}
+            }
+        }
+    }
+    let probe = probe.expect("No probe provided");
+
+    let format_cell = |rc: &(Row, Col), is_mine: bool| -> i32 {
+        let n: i32 = (rc.0 * board_size + rc.1) as i32;
+        match is_mine {
+            true => n,
+            false => -n,
+        }
+    };
+
+    let mut conditions: HashSet<BTreeSet<i32>> = HashSet::new();
+    let probe_var = format_cell(&probe, false);
+    conditions.insert(BTreeSet::from_iter(iter::once(probe_var)));
+
+    for row in 0..board_size {
+        for col in 0..board_size {
+            let cell = conf.board[row][col];
+            match cell {
+                Square::Number(n) => {
+                    let neighbours = conf.neighbours(row, col);
+
+                    let neighbours_mines: Vec<(Row, Col)> = neighbours
+                        .clone()
+                        .into_iter()
+                        .filter(|(r, c)| conf.is_mine(*r, *c))
+                        .collect();
+
+                    let neighbours_covered: Vec<(Row, Col)> = neighbours
+                        .clone()
+                        .into_iter()
+                        .filter(|(r, c)| conf.is_empty(*r, *c))
+                        .collect();
+
+                    if neighbours_covered.is_empty() {
+                        continue;
+                    }
+
+                    if n == neighbours_mines.len() {
+                        // if n = |neighbours_mines| then all covered neighbours are not mines
+                        for rc in neighbours_covered.iter() {
+                            let var = format_cell(rc, false);
+                            conditions.insert(BTreeSet::from_iter(iter::once(var)));
+                        }
+                    } else if n == neighbours_mines.len() + neighbours_covered.len() {
+                        // if n = |neighbours_mines| + |neighbours_covered| then all covered neighbours are mines
+                        for rc in neighbours_covered.iter() {
+                            let var = format_cell(rc, true);
+                            conditions.insert(BTreeSet::from_iter(iter::once(var)));
+                        }
+                    } else {
+                        let uncovered_mines_number = n - neighbours_mines.len();
+
+                        let neighbours_covered_set: BTreeSet<(Row, Col)> =
+                            BTreeSet::from_iter(neighbours_covered.iter().cloned());
+                        let neighbours_covered_powerset = powerset(neighbours_covered_set);
+                        let valid_powerset = neighbours_covered_powerset
+                            .iter()
+                            .filter(|mines_set| mines_set.len() == uncovered_mines_number)
+                            .collect::<BTreeSet<_>>();
+
+                        let mut conjuncts: Vec<Vec<i32>> = vec![];
+
+                        for mines_set in valid_powerset.iter() {
+                            let mut conjunct: Vec<i32> = vec![];
+
+                            if let Some((last, elements)) = neighbours_covered.split_last() {
+                                for rc in elements.iter() {
+                                    let var = format_cell(rc, mines_set.contains(rc));
+                                    conjunct.push(var);
+                                }
+                                let cell = format_cell(last, mines_set.contains(last));
+                                conjunct.push(cell.clone());
+                            }
+                            conjuncts.push(conjunct);
+                        }
+
+                        if conjuncts.is_empty() {
+                            continue;
+                        }
+
+                        let conjuncts_count = conjuncts.len() as u32;
+                        let conjunct_len = conjuncts[0].len() as u32;
+
+                        for choice_num in 0u32..conjunct_len.pow(conjuncts_count as u32) - 1 {
+                            let choice =
+                                format_with_radix(choice_num, conjunct_len, conjuncts_count);
+
+                            let mut new_cond: BTreeSet<i32> = BTreeSet::new();
+                            for (conjunct, position) in conjuncts.iter().zip(choice) {
+                                let conjunct = conjunct[position as usize].clone();
+                                new_cond.insert(conjunct);
+                            }
+                            conditions.insert(new_cond);
+                        }
+                    }
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    let mut conditions = conditions.into_iter().collect::<Vec<_>>();
+    conditions.sort_by(|c1, c2| c1.len().cmp(&c2.len()));
+
+    let mut solver = Solver::new();
+
+    let mut formula = CnfFormula::new();
+    for condition in conditions {
+        let clause: Vec<Lit> = condition
+            .iter()
+            .map(|v| Lit::from_dimacs(*v as isize))
+            .collect();
+        println!("{:?}", clause);
+        formula.add_clause(&clause[..]);
+    }
+
+    solver.add_formula(&formula);
+    let solution = solver.solve().unwrap();
+    solution
 }
